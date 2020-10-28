@@ -1,0 +1,716 @@
+#!/usr/bin/python2
+
+import os
+import sys
+import time
+import subprocess
+import json
+import re
+import tempfile
+
+from optparse import OptionParser
+
+BSM_INSTALL_DIR="/opt/BSMHW_NG"
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+def open_command(cmd):
+    return subprocess.Popen(cmd, stdout = subprocess.PIPE, shell = True)
+
+class BaseItem(object):
+
+    def __init__(self):
+        super(BaseItem, self).__init__()
+
+    def get_header(self):
+        return None
+
+
+class SystemEvent(BaseItem):
+
+    def __init__(self, _index, _tm, _tmstr, _owner, _name, _type, _event, _value):
+        super(SystemEvent, self).__init__()
+        self.index = _index
+        self.name = _name
+        self.tm = _tm
+        self.tmstr = _tmstr
+        self.owner = _owner
+        self.type = _type
+        self.event = _event
+        self.value = _value
+
+    def __str__(self):
+        return "{0} | {1} | 0x{2:02x} | {3} | {4} | {5} | {6}".format(self.index, ' | '.join(self.tmstr.split()), self.owner, self.name, self.type, self.event, self.value)
+
+def get_sel(options):
+    sel = list()
+    sel_addrs = dict()
+    file_to_close = None
+    if options.from_file is not None:
+        f = open(options.from_file + "_sel.log", "r")
+        file_to_close = f
+    else:
+        cmd = options.bsm_install_dir+"/bin/bsmlog.sh -H {0} -a get_sel -n all".format(options.host)
+        if sys.platform == 'win32':
+            cmd = "type {0}".format(os.path.join(SCRIPT_DIR,"sample_sel.log")) # For test
+        elif not os.path.isfile(options.bsm_install_dir+"/bin/bsmlog.sh"):
+            cmd = "cat {0}".format(os.path.join(SCRIPT_DIR,"sample_sel.log")) # For test
+        fcmd = open_command(cmd)
+        f = fcmd.stdout
+
+    fout = None
+    if options.output is not None:
+        fout_name = options.output + "_{0}.log".format("sel")
+        fout = open(fout_name, "w")
+
+    for s in f:
+
+        if fout is not None:
+            fout.write(s)
+
+        values = s.split("|")
+        if len(values) >= 8:
+            try:
+                tmstr = values[1].strip() + " " + values[2].strip()
+                tm = time.mktime(time.strptime(tmstr, "%b-%d-%Y %H:%M:%S"))
+            except (ValueError, OverflowError):
+                continue
+            if tm >= options.start_time:
+                owner_id = int(values[3].strip(), 16)
+                se = SystemEvent(int(values[0].strip()), tm, tmstr, owner_id, *([x.strip() for x in values[4:]]))
+                sel.append(se)
+                try:
+                    by_owner = sel_addrs[owner_id]
+                except KeyError:
+                    by_owner = list()
+                    sel_addrs[owner_id] = by_owner
+                by_owner.append(se)
+    if file_to_close is not None:
+        file_to_close.close()
+    if fout is not None:
+        fout.close()
+    return sel, sel_addrs
+
+
+class Sensor(BaseItem):
+
+    def __init__(self):
+        super(Sensor, self).__init__()
+        self.attrlist = None
+        self.name = None
+        self.owner_id = None
+        self.addr = None
+
+    def __str__(self):
+        return " | ".join([getattr(self,a) for a in self.attrlist])
+
+    def get_header(self):
+        return " | ".join(self.attrlist)
+
+
+def get_sensors(options):
+    sensors = dict()
+    sensors_names = dict()
+    sensors_numbers = dict()
+    file_to_close = None
+    attrs = None
+    if options.from_file is not None:
+        f = open(options.from_file + "_sensor.log", "r")
+        file_to_close = f
+    else:
+        cmd = options.bsm_install_dir+"/bin/bsmsensor.sh -H {0}".format(options.host)
+        if sys.platform == 'win32':
+            cmd = "type {0}".format(os.path.join(SCRIPT_DIR,"sample_sensor.log")) # For test
+        elif not os.path.isfile(options.bsm_install_dir+"/bin/bsmsensor.sh"):
+            cmd = "cat {0}".format(os.path.join(SCRIPT_DIR,"sample_sensor.log")) # For test
+        fcmd = open_command(cmd)
+        f = fcmd.stdout
+
+    fout = None
+    if options.output is not None:
+        fout_name = options.output + "_{0}.log".format("sensor")
+        fout = open(fout_name, "w")
+
+    for s in f:
+
+        if fout is not None:
+            fout.write(s)
+
+        values = s.split("|")
+
+        if not values[0].startswith("0x"):
+            if attrs is None:
+                attrs = [x.strip().replace(" ", "_").lower() for x in values]
+                if attrs[-1] != "read_time":
+                    attrs.append("read_time")
+            continue
+        if attrs is not None:
+            sensor = Sensor()
+            if len(values) < len(attrs):
+                values.append(time.strftime("%m/%d/%Y %H:%M:%S", time.localtime()))
+
+            for i,a in enumerate(attrs):
+                setattr(sensor, a, values[i].strip().replace("'",""))
+
+            try:
+                snlist = sensors[int(sensor.addr, 16)]
+            except KeyError:
+                snlist = list()
+                sensors[int(sensor.addr, 16)] = snlist
+            snlist.append(sensor)
+            sensor_num = int(sensor.addr, 16) & 0xffff
+            setattr(sensor, "num", sensor_num)
+            setattr(sensor, "attrlist", attrs)
+            try:
+                sn = sensors_numbers[int(sensor.owner_id, 16)]
+            except KeyError:
+                sn = dict()
+                sensors_numbers[int(sensor.owner_id, 16)] = sn
+            try:
+                snlist = sn[sensor_num]
+            except KeyError:
+                snlist = list()
+                sn[sensor_num] = snlist
+            snlist.append(sensor)
+            try:
+                snlist = sensors_names[sensor.name]
+            except KeyError:
+                snlist = list()
+                sensors_names[sensor.name] = snlist
+            snlist.append(sensor)
+
+    if file_to_close is not None:
+        file_to_close.close()
+    if fout is not None:
+        fout.close()
+
+    return sensors, sensors_names, sensors_numbers
+
+class Message(BaseItem):
+
+    def __init__(self, _tm, _tmstr, _type, _msg):
+        super(Message, self).__init__()
+        self.tm = _tm
+        self.tmstr = _tmstr
+        self.type = _type
+        self.msg = _msg
+
+    def __str__(self):
+        return self.tmstr + " " + self.type + "\t" + self.msg
+
+
+def get_messages(options):
+    msgs = list()
+    file_to_close = None
+    if options.from_file is not None:
+        f = open(options.from_file + "_msg.log", "r")
+        file_to_close = f
+    else:
+        cmd = options.bsm_install_dir+"/bin/bsmlog.sh -H {0} -a get_msg -n all".format(options.host)
+        if sys.platform == 'win32':
+            cmd = "type {0}".format(os.path.join(SCRIPT_DIR,"sample_msg.log")) # For test
+        elif not os.path.isfile(options.bsm_install_dir+"/bin/bsmlog.sh"):
+            cmd = "cat {0}".format(os.path.join(SCRIPT_DIR,"sample_msg.log")) # For test
+        fcmd = open_command(cmd)
+        f = fcmd.stdout
+
+    fout = None
+    if options.output is not None:
+        fout_name = options.output + "_{0}.log".format("msg")
+        fout = open(fout_name, "w")
+
+    for s in f:
+
+        if fout is not None:
+            fout.write(s)
+
+        values = s.split(" ", 2)
+        if len(values) >= 3:
+            try:
+                tmstr = values[0].strip() + " " + values[1].strip()
+                tm = time.mktime(time.strptime(tmstr, "%m/%d/%Y %H:%M:%S"))
+            except (ValueError, OverflowError):
+                continue
+            if tm >= options.start_time:
+                msgs.append(Message(tm, tmstr, *[x.strip().replace("'", "") for x in values[2].split("\t")]))
+    if file_to_close is not None:
+        file_to_close.close()
+    if fout is not None:
+        fout.close()
+    return msgs
+
+def expand(val, variables):
+    """
+    Replace $<varname> by value found in 'variables' or environment
+    :param val:
+    :param variables:
+    :return:
+    """
+    while True:
+        m = re.match(r'.*\$(\w+).*', val)
+        if m is not None and m.lastindex is not None and m.lastindex >= 1:
+            varname = m.group(1)
+            try:
+                v = variables[varname]
+            except KeyError:
+                v = os.getenv(varname)
+                if v is None:
+                    print("Unknown variable '{0}'".format(varname))
+                    exit(1)
+            val = re.sub(r"\$"+varname, v, val)
+        else:
+            break
+    return val
+
+def expand_all(filter_list, variables):
+    """
+    Replace variables in all values of each item of 'filter_list'
+    :param filter_list:
+    :param variables:
+    :return:
+    """
+    for _filter in filter_list:
+        for n,v in _filter.iteritems():
+            _filter[n] = expand(v, variables)
+    return filter_list
+
+def str2num(val):
+    num_val = None
+    if val.startswith("0x"):
+        try:
+            v = int(val, 16)
+            num_val = v
+        except ValueError:
+            pass
+    else:
+        try:
+            v = float(val)
+            num_val = v
+        except ValueError:
+            pass
+    return num_val
+
+COMP_FUNCTION = {
+    "min": lambda v, f: v > f,
+    "max": lambda v, f: v < f
+}
+
+def match(val, _filter, _filter_name):
+    """
+    Check if val match '_filter'.
+    '_filter' can be a numeric value, a string or a regular expression
+    :param val:
+    :param _filter:
+    :param _filter_name:
+    :return:
+    """
+    res = False
+    filter_num = str2num(_filter)
+    if filter_num is not None:
+        val_num = str2num(val)
+        if val_num is not None:
+            try:
+                res = COMP_FUNCTION[_filter_name](val_num, filter_num)
+            except KeyError:
+                res = val_num == filter_num
+    else:
+        res = len(_filter) == 0 or (re.match(_filter, val) is not None)
+    return res
+
+def explore_list(l):
+    """
+    List all elements of 'l'
+    'l' can be a list or a dictionnary
+    Elements of 'l' can be objects, lists or dictionnaries
+    :param l:
+    :return:
+    """
+    if isinstance(l , list):
+        for e in l:
+            if isinstance(e, list) or isinstance(e, dict):
+                for ee in explore_list(e):
+                    yield ee
+            else:
+                yield e
+    else:
+        for e in l.itervalues():
+            if isinstance(e, list) or isinstance(e, dict):
+                for ee in explore_list(e):
+                    yield ee
+            else:
+                yield e
+
+def process_msgs(filter_kind, filter_list, _msgs):
+    """
+    Process BMC messages
+    :param filter_list: list of filters (from json)
+    :param _msgs: messages list
+    :return:
+    """
+    match_list = list()
+    miss_list = list()
+    for f in filter_list:
+        cnt = 0
+        evt_list = _msgs
+
+        if evt_list is not None:
+            for e in explore_list(evt_list):
+                if (match(e.type, f["type"], "type") and
+                        match(e.msg, f["txt"], "msg")):
+                    cnt += 1
+                    match_list.append(e)
+        if cnt == 0:
+            miss_list.append(f)
+
+    return match_list, miss_list
+
+def process_sensors(filter_kind, filter_list, _sensors, _sensors_names, _sensors_numbers):
+    """
+    Process sensors list
+    :param filter_list: filter list (from json)
+    :param _sensors: sensors list
+    :param _sensors_names: sensors by name
+    :param _sensors_numbers: sensors by owner / number
+    :return: list of matching sensors, list of unmatched filters
+    """
+    match_list = list()
+    miss_list = list()
+    for f in filter_list:
+        evt_list = _sensors
+        addr = str2num(f["addr"])
+        if addr is not None:
+            evt_list = [_sensors[int(addr)]]
+        else:
+            try:
+                owner_id = str2num(f["owner"])
+                if owner_id is not None:
+                    evt_list = _sensors_numbers[owner_id]
+                    sensor_num = str2num(f["num"])
+                    if sensor_num is not None:
+                        try:
+                            evt_list = [evt_list[sensor_num]]
+                        except KeyError:
+                            evt_list = None
+                            pass
+                else:
+                    sensor_name = f["name"]
+                    if len(sensor_name) > 0:
+                        evt_list = [x for x in explore_list(_sensors_names) if match(x.name, sensor_name, "name")]
+            except KeyError:
+                evt_list = None
+        if evt_list is not None:
+            cnt = 0
+            for e in explore_list(evt_list):
+                _min = match(e.reading, f["min"], "min")
+                _max = match(e.reading, f["max"], "max")
+                if filter_kind == "forbidden":
+                    in_min_max = (((not _min) if len(f["min"]) > 0 else True) or
+                                 ((not _max) if len(f["max"]) > 0 else True))
+                else:
+                    in_min_max = _min and _max
+                if (match(e.addr, f["addr"], "addr") and
+                        match(str(e.owner_id), f["owner"], "owner") and
+                        match(str(e.num), f["num"], "num") and
+                        match(e.name, f["name"], "name") and
+                        match(e.reading, f["value"], "value") and
+                        match(e.event, f["status"], "status") and
+                        in_min_max):
+                    cnt += 1
+                    match_list.append(e)
+            if cnt == 0:
+                miss_list.append(f)
+        else:
+            miss_list.append(f)
+
+    return match_list, miss_list
+
+def process_sel(filter_kind, filter_list, _sel, _sel_addr):
+    """
+    Process system event log
+    :param filter_list: list of filters (from json)
+    :param _sel: events list
+    :param _sel_addr: events by sensor address
+    :return: list of matching events, list of unmatched filters
+    """
+    match_list = list()
+    miss_list = list()
+    for f in filter_list:
+        evt_list = _sel
+        owner_id = str2num(f["owner"])
+        if owner_id is not None:
+            try:
+                # Use list of events associated to owner id
+                evt_list = _sel_addr[owner_id]
+            except KeyError:
+                evt_list = None
+        if evt_list is not None:
+            cnt = 0
+            for e in explore_list(evt_list):
+                if (match(str(e.owner), f["owner"], "owner") and
+                    match(str(e.name), f["name"], "name") and
+                    match(e.type, f["type"], "type") and
+                    match(e.value, f["value"], "value")):
+                    cnt += 1
+                    match_list.append(e)
+            if cnt == 0:
+                miss_list.append(f)
+        else:
+            miss_list.append(f)
+
+    return match_list, miss_list
+
+RESULT_TITLE = {
+    "sel"   : "System events",
+    "msg"   : "Messages",
+    "sensor": "Sensors"
+}
+
+DEFAULT_SENSOR_FILTER={
+    "sensor" : {
+        "forbidden" : [
+            {"addr": "", "owner":"", "num":"", "name": "", "value": "", "min": "", "max": ""}
+        ]
+    }
+}
+
+ERROR_PREFIX = "BMC_ERROR : "
+TAP_PREFIX = "bsmcheck/{0} "
+
+def indent(level):
+    return level * "\t"
+
+def writeln(options, level = 0, txt = "", underline = None, box = False):
+    
+    if options.quiet:
+        return
+
+    _box = box and underline is not None
+    if _box:
+        print(indent(level) + underline * (len(txt) + 4))
+    print(indent(level) + ((underline + " ") if _box else "") + txt + ((" " + underline) if _box else ""))
+    if underline is not None:
+        print(indent(level) + underline * (len(txt) + (4 if _box else 0)))
+
+def ftap_write(f, l, s):
+    if f is not None:
+        s = (l * '\t') + s + '\n'
+        f.write(s)
+        f.flush()
+
+def ftap_status(f, l, n, ok, comment = None):
+    ftap_write(f, l, ("ok" if ok else "not ok") + " " + str(n) + ((" " + comment) if comment is not None else ""))
+
+def get_loop_file(options):
+    return os.path.join(tempfile.gettempdir(),"bsm_loop_" + options.host)
+
+def main(options):
+
+    variables = None
+    if options.variables is not None:
+        variables = {}
+        for (n, v) in [(s.split("=")) for s in  options.variables.split(',')]:
+            variables[n] = v
+
+    filter_list = dict()
+    result = 0
+    test_list = options.template
+    if test_list is None:
+        if options.collect is not None:
+            test_list = "sensor"
+        else:
+            writeln(options, 0, "No test information")
+            return 1
+
+    writeln(options, 0, "{0} BMC logs : ".format("Collecting" if options.collect is not None else "Checking") + test_list)
+
+    loop_file = get_loop_file(options)
+
+    if options.loop is not None:
+        open(loop_file, "w").close()
+
+    while True:
+        ftap = None
+
+        process_functions = {
+            "sel": (process_sel, [], get_sel),
+            "sensor": (process_sensors, [], get_sensors),
+            "msg": (process_msgs, [], get_messages)
+        }
+
+        previous_number = 0
+        if options.tap_file is not None:
+            previous_lines = list()
+            if os.path.isfile(options.tap_file):
+                # Read tap file
+                ftap = open(options.tap_file, "r")
+                previous_lines = ftap.readlines()
+                ftap.close()
+                if len(previous_lines) > 0 and previous_lines[0].startswith("TAP version"):
+                    previous_lines = previous_lines[1:]
+                else:
+                    previous_lines = list()
+            ftap = open(options.tap_file, "w")
+            ftap_write(ftap, 0, "TAP version 13")
+            # Write previous content
+            for s in previous_lines:
+                if len(s.strip()) > 0 and not s.startswith("1.."):
+                    ftap.write(s)
+                    if s.startswith(("ok","not ok")):
+                        previous_number += 1
+
+
+        tests = test_list.split(",")
+        test_num = previous_number
+        for tname in tests:
+            test_num += 1
+            test_ok = True
+
+            writeln(options)
+            writeln(options, 0, "Template : " + tname, '*')
+
+            filters = None
+
+            try:
+                # Load JSON file
+                fjson = open(tname+".json", "r")
+                filters = json.load(fjson)
+                try:
+                    fjson.close()
+                except IOError:
+                    pass
+            except (IOError, OSError):
+                if options.collect is not None and (tname == "sensor" or tname == "collect"):
+                    filters = DEFAULT_SENSOR_FILTER
+                else:
+                    writeln(options, 0, "Unable to open file '{0}'".format(tname+".json"))
+                    exit(-1)
+
+            filter_list[tname] = filters
+            subtest_num = 0
+            ftap_write(ftap, 0, "#Subtest: " + tname)
+            for filter_type in iter(filters.keys()):
+                subtest_num += 1
+                last_error = None
+                # Get data if necessary
+                proc = process_functions[filter_type]
+                # proc[0] : processing function
+                # proc[1] : list of data lists or dicts
+                # proc[2] : function to get data
+                if len(proc[1]) == 0: #if no data yet
+                    val = proc[2](options)
+                    if isinstance(val, tuple):
+                        proc[1].extend(list(val))
+                    else:
+                        proc[1].extend([val])
+
+                # filter_kind = mandatory, forbidden
+                ok = True
+                writeln(options)
+                writeln(options, 1, RESULT_TITLE[filter_type] + ":", '=')
+                for filter_kind in filters[filter_type].iterkeys():
+                    try:
+                        # Call specific function for filter_type with associated list(s)
+                        match_list, miss_list = proc[0](filter_kind, expand_all(filters[filter_type][filter_kind], variables),*proc[1])
+                        if filter_kind == "mandatory":
+                            if len(miss_list) != 0:
+                                writeln(options)
+                                writeln(options, 2, "Missing :")
+                                for f in miss_list:
+                                    last_error = "Missing " + ", ".join(k + ": " + v for k,v in f.iteritems())
+                                    writeln(options, 3, ERROR_PREFIX + last_error)
+                                    last_error = "-> " + last_error
+                                ok = False
+                                result = 1
+                        else:
+                            if len(match_list) > 0:
+                                if options.collect is not None:
+                                    # Write matching items to file
+                                    fout_name = options.collect + "_{0}{1}.log".format(filter_type,
+                                                                    "" if options.loop is None else ("_" + time.strftime("%Y_%m_%d", time.localtime())))
+                                    # Write header on new file
+                                    write_head = not os.path.isfile(fout_name)
+                                    with open(fout_name, "a+") as fout:
+                                        for e in match_list:
+                                            if write_head and e.get_header() is not None:
+                                                # Write file header if necessary
+                                                fout.write(e.get_header() + "\n")
+                                                write_head = False
+                                            fout.write(str(e) + "\n")
+                                else:
+                                    writeln(options)
+                                    writeln(options, 2, "Forbidden :")
+                                    for e in match_list:
+                                        last_error = str(e)
+                                        writeln(options, 3, ERROR_PREFIX + last_error)
+                                        last_error = "-> " + last_error
+                                    ok = False
+                                    result = 1
+                    except KeyError:
+                        writeln(options, 2, "Unknown filter type")
+                if ok:
+                    writeln(options, 1, "Ok")
+                else:
+                    test_ok = False
+                ftap_status(ftap, 1, subtest_num, ok, last_error)
+            ftap_write(ftap, 1, "1.." + str(subtest_num))
+
+            ftap_status(ftap, 0, test_num, test_ok, TAP_PREFIX.format(tname))
+
+        ftap_write(ftap, 0, "1.." + str(test_num))
+        if ftap is not None:
+            ftap.close()
+            
+        if options.loop is None or options.loop <= 0:
+            break
+
+        time.sleep(options.loop)
+        if not os.path.isfile(loop_file):
+            break
+
+    return result
+
+usage = "%prog [options]"
+
+if __name__ == "__main__":
+    parser = OptionParser(usage)
+
+    parser.add_option("-H", "--host", action = "store", type = "string", dest = "host", default = None,
+                      help = "[Required] Target node address or name")
+    parser.add_option("-t", "--start_time", action = "store", type = "float", dest = "start_time", default = 0,
+                      help = "Test start time (s)")
+    parser.add_option("-T", "--template", action = "store", type = "string", dest = "template", default = None,
+                      help = "Test(s) name(s) (coma separated)")
+    parser.add_option("-i", "--bsm_install_dir", action = "store", type = "string", dest = "bsm_install_dir", default = BSM_INSTALL_DIR,
+                      help = "BSM installation directory (default="+BSM_INSTALL_DIR+")")
+    parser.add_option("-v", "--variables", action = "store", type = "string", dest = "variables", default = None,
+                      help = "Coma separated list of variables in the form <name>=<value>")
+    parser.add_option("-c", "--collect", action = "store", type = "string", dest = "collect", default = None,
+                      help = "Base name of the files where data will be collected (generated files are <base>_[msg|sel|sensor].log)")
+    parser.add_option("-o", "--output", action = "store", type = "string", dest = "output", default = None,
+                      help = "Base name of the files where data will be copied (generated files are <base>_[msg|sel|sensor].log)")
+    parser.add_option("-f", "--from_file", action = "store", type = "string", dest = "from_file", default = None,
+                      help = "Base name of the files from where data will be read (files read are <base>_[msg|sel|sensor].log)")
+    parser.add_option("-p", "--tap_file", action = "store", type = "string", dest = "tap_file", default = None,
+                      help = "Generate TAP file")
+    parser.add_option("-l", "--loop", action = "store", type = "int", dest = "loop", default = None,
+                      help = "Collect events every <loop> seconds")
+    parser.add_option("-s", "--stop", action = "store_true", dest = "stop", default = False,
+                      help = "Stop looping")
+    parser.add_option("-q", "--quiet", action = "store_true", dest = "quiet", default = False,
+                      help = "No output")
+
+    (opts, args) = parser.parse_args()
+
+    if opts.host is None:
+        parser.error("Missing host parameter")
+        sys.exit(-1)
+        
+    if opts.stop:
+        try:
+            os.remove(get_loop_file(opts))
+        except IOError:
+            pass
+        except OSError:
+            pass
+        sys.exit(0)
+
+    sys.exit(main(opts))
